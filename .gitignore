@@ -1,0 +1,7 @@
+*.tlog
+*.ipdb
+*.iobj
+*.exp
+*.idb
+*.lastbuildstate
+*.db
