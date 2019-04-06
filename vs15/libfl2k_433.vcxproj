@@ -59,7 +59,7 @@
       </PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>RTLSDR;_DEBUG;_WINDOWS;_USRDLL;libfl2k_433_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>RTLSDR;_CRT_SECURE_NO_WARNINGS;_DEBUG;_WINDOWS;_USRDLL;libfl2k_433_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\include;..\..\libosmo-fl2k\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
@@ -92,11 +92,13 @@
   <ItemGroup>
     <ClCompile Include="..\src\libfl2k_433.c" />
     <ClCompile Include="..\src\redir_print.c" />
+    <ClCompile Include="..\src\sinegen.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\include\libfl2k_433.h" />
     <ClInclude Include="..\include\libfl2k_433_export.h" />
     <ClInclude Include="..\include\redir_print.h" />
+    <ClInclude Include="..\include\sinegen.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

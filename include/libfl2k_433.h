@@ -25,16 +25,16 @@ extern "C" {
 
 #include "libfl2k_433_export.h"
 #include "osmo-fl2k.h"
+#include "sinegen.h"
 #include "redir_print.h"
 
 #define FL2K_433_DEFAULT_SAMPLE_RATE 85555554
-#define FL2K_433_DEFAULT_CARRIER 6183693
+#define FL2K_433_DEFAULT_CARRIER1 6183693
+#define FL2K_433_DEFAULT_CARRIER2 0 // 0 = disabled
 #define FL2K_433_DEFAULT_DEV_IDX 0
 #define FL2K_433_DEFAULT_VERBOSITY 1
 #define FL2K_433_DEFAULT_INIT_TIME 200
 
-#define CARRIER_MIN 1000						// is 1000 a realistic threshold?
-#define MAX_CARRIER_ALLOC (10*1024*1024)		// 10 MB = 8 times FL2K_BUF_LEN
 #define MAX_PATHLEN 300
 
 typedef enum {
@@ -54,7 +54,8 @@ typedef enum {
 		int dev_index;				// device index of FL2K device to be used
 		char out_dir[MAX_PATHLEN];	// target directory for file mode
 		uint32_t samp_rate;			// sample rate. Max value depends on the USB(3) chipset (around 150 MHz)
-		uint32_t carrier;			// carrier frequency
+		uint32_t carrier1;			// primary carrier frequency (OOK + FSK)
+		uint32_t carrier2;			// secondary carrier frequency (FSK)
 		uint8_t verbose;			// debug level. 0 = silent
 		uint32_t inittime_ms;		// milliseconds to wait for fl2k to initialize before transmitting actual payload
 	} fl2k433cfg, *pfl2k433cfg;
@@ -69,9 +70,10 @@ typedef enum {
 
 	// Relevant modulation types
 	typedef enum {
-		MODULATION_TYPE_SINE = 0, // Output a continuous sine wave (for testing purposes)
-		MODULATION_TYPE_OOK = 1, // Non-null sample: Send carrier. Null sample: Send nothing
-		MODULATION_TYPE_FSK = 2 // Not implemented, yet
+		MODULATION_TYPE_NONE = 0, // invalid modulation types (for internal use)
+		MODULATION_TYPE_OOK  = 1, // Non-null sample: Send primary carrier frequency. Null sample: Send nothing (0 MHz)
+		MODULATION_TYPE_FSK  = 2, // Non-null sample: Send primary carrier frequency. Null sample: Send secondary carrier frequency
+		MODULATION_TYPE_SINE = 3  // Output a continuous sine wave (for testing purposes)
 	} mod_type;
 
 	// Tx messages that can be queued in in the fl2k_433 instance
@@ -83,6 +85,12 @@ typedef enum {
 		uint32_t samp_rate;
 		TxMsg *next;
 	}TxMsg, *pTxMsg;
+
+	typedef struct _fl2k_data_info_fm_t { // extended version of fl2k_data_info_t for file mode
+		fl2k_data_info_t di;
+		mod_type msg_mod;      // != MODULATION_TYPE_NONE if a message is contained
+		int      msg_finished; // > 0 if the message was sent completely
+	} fl2k_data_info_fm_t;
 
 typedef struct _fl2k_433 {
 	// public:
@@ -101,11 +109,7 @@ typedef struct _fl2k_433 {
 									/* TX buffer */
 	char txbuf[FL2K_BUF_LEN];		// tx buffer. Filled and passed to libosmo-fl2k by fl2k_callback.
 
-									/* Carrier signal */
-	char* carrier_buf;				// Carrier buffer. Alloced on start() with at least FL2K_BUF_LEN bytes, at most MAX_CARRIER_ALLOC
-	uint32_t carrier_freq;			// Frequency of the current carrier. Carrier will be re-used on next start() if still matching.
-	uint32_t carrier_len;			// Byte/sample length of the carrier buffer. The concrete length is chosen to find the closest match with a multiple of the sine wave length so the samples can be looped nicely
-	uint32_t carrier_pos;			// Current position within carrier (next sample will be taken from here)
+	SineGen *sg;
 } fl2k_433_t;
 
 //public methods

@@ -41,12 +41,10 @@
 static void		fl2k_callback(fl2k_data_info_t *data_info);	// Callback function for libosmo-fl2k
 static int		InitFl2k(fl2k_433_t *fl2k);				// Initializes the FL2K device using libosmo-fl2k
 static void		loadDefaultConfig(fl2k_433_t *fl2k);	// Loads the default configuration
-static int		InitCarrier(fl2k_433_t *fl2k);
 static TxMsg*	TxPop(fl2k_433_t *fl2k);
 static void		TxPush(fl2k_433_t *fl2k, TxMsg *msg);
-static int isBufFilled(char *buf, int len);
-static FILE *openOutputFile(char *dir, uint32_t samp_rate, uint32_t carrier, uint32_t filenum);
-static void *file_mode(fl2k_433_t *fl2k);
+static FILE*	openOutputFile(char *dir, mod_type mod, uint32_t samp_rate, uint32_t carrier1, uint32_t carrier2, uint32_t *filenum);
+static void*	file_mode(fl2k_433_t *fl2k);
 
 FL2K_433_API int	fl2k_433_init(fl2k_433_t **out_fl2k) {
 	if (!out_fl2k) {
@@ -58,6 +56,7 @@ FL2K_433_API int	fl2k_433_init(fl2k_433_t **out_fl2k) {
 	if (fl2k) {
 		fl2k->opstate = FL2K433_STOPPED;
 		loadDefaultConfig(fl2k);
+		SineGen_init(&fl2k->sg);
 	}
 	*out_fl2k = fl2k;
 	//todo: print version?
@@ -79,11 +78,8 @@ FL2K_433_API int fl2k_433_destroy(fl2k_433_t *fl2k) {
 		m = TxPop(fl2k);
 	}
 
-	// free carrier
-	if (fl2k->carrier_buf) {
-		free(fl2k->carrier_buf);
-		fl2k->carrier_buf = NULL;
-	}
+	// destroy sine generator
+	if (fl2k->sg) SineGen_destroy(fl2k->sg);
 
 	// free object
 	free(fl2k);
@@ -97,58 +93,11 @@ FL2K_433_API int getState(fl2k_433_t *fl2k) {
 static void loadDefaultConfig(fl2k_433_t *fl2k) {
 	fl2k->cfg.dev_index = FL2K_433_DEFAULT_DEV_IDX;
 	fl2k->cfg.samp_rate = FL2K_433_DEFAULT_SAMPLE_RATE;
-	fl2k->cfg.carrier = FL2K_433_DEFAULT_CARRIER;
+	fl2k->cfg.carrier1 = FL2K_433_DEFAULT_CARRIER1;
+	fl2k->cfg.carrier2 = FL2K_433_DEFAULT_CARRIER2;
 	fl2k->cfg.verbose = FL2K_433_DEFAULT_VERBOSITY;
 	memset(fl2k->cfg.out_dir, 0, sizeof(fl2k->cfg.out_dir));
 	fl2k->cfg.inittime_ms = FL2K_433_DEFAULT_INIT_TIME;
-}
-
-static int InitCarrier(fl2k_433_t *fl2k) {
-	// Sanity / context checks
-	if (fl2k->cfg.carrier < CARRIER_MIN) {
-		fl2k433_fprintf(stderr, "InitCarrier: Carrier frequency is too low.\n");
-		return 0;
-	}
-	if (fl2k->carrier_buf && fl2k->carrier_freq == fl2k->cfg.carrier) {
-		if (fl2k->cfg.verbose > 1) fl2k433_fprintf(stderr, "Carrier from last run can be reused.\n");
-		return 1;// carrier is already set, we can simple (re)use it.
-	}
-
-	// Calculate required number of samples for a whole sine wave length and check against Nyquist
-	double samplesPerCycle = (double)fl2k->cfg.samp_rate / (double)fl2k->cfg.carrier;
-	if (samplesPerCycle < 2.0 && fl2k->cfg.verbose > 0) fl2k433_fprintf(stderr, "Warning: Carrier frequency %lu higher than %lu, violating Nyquist theoreom.\n", fl2k->cfg.carrier, (fl2k->cfg.samp_rate + 1) / 2);
-
-	// Find a sine wave sequence (in the desired length interval) which ends between two sample points (so the signal buffer can be repeated with little unwanted frequencies)
-	int cycles_min = ((int)((double)FL2K_BUF_LEN / samplesPerCycle)) + 1;
-	int cycles_max = ((int)((double)MAX_CARRIER_ALLOC / samplesPerCycle)) - 1;
-	int cycles_opt = 0;
-	double diff_opt = 0.5;
-	for (int c = cycles_min; c < cycles_max; c++) {
-		double samples = samplesPerCycle * (double)c;
-		double mod = fmod(samples, 1.0);
-		double diff = min(mod, 1.0 - mod);
-		if (diff < diff_opt) {
-			diff_opt = diff;
-			cycles_opt = c;
-		}
-	}
-	if (fl2k->cfg.verbose > 1) fl2k433_fprintf(stderr, "Found optimal carrier with %lu cycles (min diff = %f).\n", cycles_opt, diff_opt);
-
-	// Initialize / allocate and fill the carrier buffer
-	fl2k->carrier_len = (int)(0.5 + ((double)cycles_opt * samplesPerCycle));
-	fl2k->carrier_freq = fl2k->cfg.carrier;
-	fl2k->carrier_pos = 0;
-	fl2k->carrier_buf = (char*)malloc(fl2k->carrier_len);
-	if (!fl2k->carrier_buf) {
-		fl2k433_fprintf(stderr, "Memory for carrier buffer could not be allocated.\n");
-		return 0;
-	}
-	for (uint32_t s = 0; s < fl2k->carrier_len; s++) {
-		double current_radian = M_PI * s * 2 / samplesPerCycle;
-		double carrier_sin_value = sin(current_radian);
-		fl2k->carrier_buf[s] = (int8_t)(carrier_sin_value * 127.0);
-	}
-	return 1;
 }
 
 static TxMsg *TxPop(fl2k_433_t *fl2k) {
@@ -181,7 +130,7 @@ FL2K_433_API int QueueTxMsg(fl2k_433_t *fl2k, TxMsg *msg_in) {
 		TxPush(fl2k, msg_out);
 		r = 0;
 	}
-	else if (msg_in->mod == MODULATION_TYPE_OOK) {
+	else if (msg_in->mod == MODULATION_TYPE_OOK || msg_in->mod == MODULATION_TYPE_FSK) {
 		TxMsg *msg_out = calloc(1, sizeof(TxMsg));
 		msg_out->mod = msg_in->mod;
 		msg_out->samp_rate = fl2k->cfg.samp_rate;
@@ -208,9 +157,6 @@ FL2K_433_API int QueueTxMsg(fl2k_433_t *fl2k, TxMsg *msg_in) {
 		}
 		TxPush(fl2k, msg_out);
 		r = 0;
-	}
-	else if (msg_in->mod == MODULATION_TYPE_OOK) {
-		fl2k433_fprintf(stderr, "QueueTxMsg: FSK modulation is not supported, yet.\n");
 	}
 	else {
 		fl2k433_fprintf(stderr, "QueueTxMsg: TX message can not be queued due to unknown modulation type\n");
@@ -244,7 +190,7 @@ static void fl2k_callback(fl2k_data_info_t *data_info) {
 	if (!data_info || !data_info->ctx) return;
 
 	data_info->sampletype_signed = 1;
-	data_info->r_buf = zero_buf; // worst cases > good cases, so we choose the zero array by default
+	data_info->r_buf = zero_buf; // more bad cases than good cases, so we choose the zero array by default
 
 	// check context and fill data_info
 	fl2k_433_t *fl2k = (fl2k_433_t*)data_info->ctx;
@@ -252,86 +198,94 @@ static void fl2k_callback(fl2k_data_info_t *data_info) {
 		fl2k433_fprintf(stderr, "fl2k_callback: Missing context, providing NULL samples.\n");
 		return;
 	}
-	if (!fl2k->carrier_buf) {
-		fl2k433_fprintf(stderr, "fl2k_callback: Missing carrier buffer, providing NULL samples.\n");
+	if (!fl2k->sg) {
+		fl2k433_fprintf(stderr, "fl2k_callback: Missing sine generator, providing NULL samples.\n");
 		return;
 	}
 
 	// if we are in device mode, give the adapter some time to initialize (output nullsamples only)
-	if (fl2k->cfg.inittime_ms > 0 && fl2k->opstate == FL2K433_STARTUP_FL2K && fl2k->starttime && getMilliSeconds() < (fl2k->starttime + fl2k->cfg.inittime_ms)) {
-		return;
+	if (fl2k->opstate == FL2K433_STARTUP_FL2K && fl2k->cfg.inittime_ms > 0 && fl2k->starttime && getMilliSeconds() < (fl2k->starttime + fl2k->cfg.inittime_ms)) {
+		return; // output NULL samples during starting phase
 	}
 	if (fl2k->opstate == FL2K433_STARTUP_FL2K && fl2k->starttime) {
 		fl2k->starttime = 0;
 	}
 
-	// startup state ends here
+	// startup state ends here. Prepare for delivering samples...
 	if      (fl2k->opstate == FL2K433_STARTUP_FL2K) fl2k->opstate = FL2K433_RUNNING_FL2K;
 	else if (fl2k->opstate == FL2K433_STARTUP_FILE) fl2k->opstate = FL2K433_RUNNING_FILE;
+	data_info->r_buf = fl2k->txbuf;
 
-	// 	If there's nothing to do: output nullsamples only
-	if (!fl2k->txqueue) return;
-
-	// theres a TX message in queue. Some basic checks, then prepare the signal...
-	if (fl2k->txqueue->mod < MODULATION_TYPE_SINE || fl2k->txqueue->mod > MODULATION_TYPE_FSK) {
+	// Preparatory checks: Is everything there we need to generate some signal?
+	int no_sig = 0; // will be set to > 0 if we just need to output silence (0 MHz). It's the case, if...
+	if (!fl2k->txqueue) no_sig = 1; //  ...there's nothing in the queue or...
+	else if (fl2k->txqueue->mod < MODULATION_TYPE_OOK || fl2k->txqueue->mod > MODULATION_TYPE_SINE){ // ...if we find an unknown modulation type or...
 		fl2k433_fprintf(stderr, "fl2k_callback: Unknown modulation type.\n");
-		return;
+		no_sig = 1;
 	}
-	if (fl2k->txqueue->mod != MODULATION_TYPE_SINE && (!fl2k->txqueue->buf || !fl2k->txqueue->len)) {
+	else if (fl2k->txqueue->mod != MODULATION_TYPE_SINE && (!fl2k->txqueue->buf || !fl2k->txqueue->len)) { // .. if the message has no data (internal error)...
 		fl2k433_fprintf(stderr, "fl2k_callback: Unexpected condition, TX message has no data.\n");
+		no_sig = 1;
+	}
+	if(no_sig) {
+		SineGen_configure(fl2k->sg, fl2k->cfg.samp_rate, 0);
+		for (uint32_t a = 0; a < sizeof(fl2k->txbuf) /*FL2K_BUF_LEN*/; a++) {
+			fl2k->txbuf[a] = SineGen_getSample(fl2k->sg);
+		}
 		return;
 	}
 
-	// 1a) Fill signal with sine (OOK & test sine):
-	if (fl2k->txqueue->mod == MODULATION_TYPE_OOK || fl2k->txqueue->mod == MODULATION_TYPE_SINE) {
-		data_info->r_buf = fl2k->txbuf;
+	// =========== If we reach here, we have some message to transmit =============
 
-		// Copy carrier segment to txbuf
-		uint32_t part1len = min(fl2k->carrier_len - fl2k->carrier_pos, FL2K_BUF_LEN);
-		memcpy(fl2k->txbuf, &fl2k->carrier_buf[fl2k->carrier_pos], part1len);
-		fl2k->carrier_pos = (fl2k->carrier_pos + part1len) % fl2k->carrier_len;
-		if (part1len < FL2K_BUF_LEN) {
-			uint32_t part2len = min(fl2k->carrier_len - fl2k->carrier_pos, (FL2K_BUF_LEN - part1len));
-			memcpy(&fl2k->txbuf[part1len], &fl2k->carrier_buf[fl2k->carrier_pos], part2len);
-			fl2k->carrier_pos = (fl2k->carrier_pos + part2len) % fl2k->carrier_len;
-			if ((part1len + part2len) > FL2K_BUF_LEN) {
-				fl2k433_fprintf(stderr, "fl2k_callback: Unexpected condition, carrier buffer too small.\n");
-			}
-		}
-		// don't repeat sine wave forever in filemode
-		if (fl2k->txqueue->mod == MODULATION_TYPE_SINE) {
-			if (fl2k->opstate == FL2K433_RUNNING_FILE) {
-				TxMsg *m = TxPop(fl2k);
-				free(m);
-			}
-		}
-		// 1b) Mask with TX samples (OOK)
-		else if (fl2k->txqueue->mod == MODULATION_TYPE_OOK) {
-			if(fl2k->cfg.verbose > 1 && fl2k->txqueue_sent == 0) fl2k433_fprintf(stderr, "fl2k_callback: start sending an OOK signal.\n");
-			// Mask with TX samples
-			char *mask = &fl2k->txqueue->buf[fl2k->txqueue_sent];
-			char *end = &fl2k->txqueue->buf[fl2k->txqueue->len];
-			for (uint32_t a = 0; a < sizeof(fl2k->txbuf) /*FL2K_BUF_LEN*/; a++) {
-				if (&mask[a] >= end || mask[a] == 0) fl2k->txbuf[a] = 0;
-			}
-			fl2k->txqueue_sent += sizeof(fl2k->txbuf);
-			// If we are ready with the TX message, remove it and free its memory
-			if (fl2k->txqueue_sent >= fl2k->txqueue->len) {
-				if(fl2k->cfg.verbose > 1) fl2k433_fprintf(stderr, "fl2k_callback: finished sending an OOK signal.\n");
-				TxMsg *m = TxPop(fl2k); // will clear txqueue_sent
-				if(m->buf) free(m->buf);
-				free(m);
-			}
+	// file mode only: inform caller about contained message
+	if (fl2k->opstate == FL2K433_RUNNING_FILE) {
+		fl2k_data_info_fm_t *extdat = (fl2k_data_info_fm_t*)data_info;
+		extdat->msg_mod = fl2k->txqueue->mod;
+	}
+
+	// SINE: Set samples to a continuous sine wave (test purposes)
+	if (fl2k->txqueue->mod == MODULATION_TYPE_SINE) {
+		SineGen_configure(fl2k->sg, fl2k->cfg.samp_rate, fl2k->cfg.carrier1);
+		for (uint32_t a = 0; a < sizeof(fl2k->txbuf) /*FL2K_BUF_LEN*/; a++) {
+			fl2k->txbuf[a] = SineGen_getSample(fl2k->sg);
 		}
 	}
-	// 2) FSK
-	else if (fl2k->txqueue->mod == MODULATION_TYPE_FSK) {
-		if (fl2k->cfg.verbose > 0) fl2k433_fprintf(stderr, "fl2k_callback: FSK modulation is not supported, yet.\n");
-		// remove FSK message
-		TxMsg *m = TxPop(fl2k);
-		if (m->buf) free(m->buf);
+	// OOK / FSK: Compose signal from samples of primary and secondary carrier
+	else {
+		// Compose final signal segment into txbuf
+		char *sig_s = &fl2k->txqueue->buf[fl2k->txqueue_sent]; // start of (remaining) tx signal
+		char *sig_e = &fl2k->txqueue->buf[fl2k->txqueue->len]; // end of tx signal
+		if (fl2k->cfg.verbose > 1 && fl2k->txqueue_sent == 0) fl2k433_fprintf(stdout, "fl2k_callback: start sending an OOK signal.\n");
+		char prev = -1; // -1 is just a placeholder for "no prev"
+		for (uint32_t a = 0; a < sizeof(fl2k->txbuf) /*FL2K_BUF_LEN*/; a++) {
+			char crnt = (&sig_s[a] < sig_e ? sig_s[a] : -2); // -2 is just a placeholder for "exceeded end of signal"
+			if (crnt != prev) { // reconfigure sine generator only when signal state has changed
+				unsigned long freq = 0; // generate 0 MHz signal if we are ourside our signal
+				if (crnt > 0) freq = fl2k->cfg.carrier1; // set high samples to sine with primary carrier freq (OOK+FSK). 
+				else if (crnt == 0) freq = (fl2k->txqueue->mod == MODULATION_TYPE_FSK ? fl2k->cfg.carrier2 : 0); // set low samples to sine with secondary carrier freq (FSK) or to 0 MHz for OOK
+				SineGen_configure(fl2k->sg, fl2k->cfg.samp_rate, freq);
+				prev = crnt;
+			}
+			fl2k->txbuf[a] = SineGen_getSample(fl2k->sg);
+		}
+		fl2k->txqueue_sent += sizeof(fl2k->txbuf);
+	}
+
+	// remove TX message and free its memory if it has been sent completely (or if a continuos SINE wave got sent in file mode, because we won't save an infinite stream here)
+	if ((fl2k->txqueue->mod == MODULATION_TYPE_SINE && fl2k->opstate == FL2K433_RUNNING_FILE) ||
+		(fl2k->txqueue_sent >= fl2k->txqueue->len)) {
+		if(fl2k->cfg.verbose > 1) fl2k433_fprintf(stdout, "fl2k_callback: finished sending.\n");
+		TxMsg *m = TxPop(fl2k); // will clear txqueue_sent
+		if(m->buf) free(m->buf);
 		free(m);
+
+		// file mode only: inform caller about finished message
+		if (fl2k->opstate == FL2K433_RUNNING_FILE) {
+			fl2k_data_info_fm_t *extdat = (fl2k_data_info_fm_t*)data_info;
+			extdat->msg_finished = 1;
+		}
 	}
+
 	return;
 }
 
@@ -348,19 +302,16 @@ FL2K_433_API int txstart(fl2k_433_t *fl2k) {
 		return r;
 	}
 
-	// Initialize carrier
-	if (!InitCarrier(fl2k)) {
-		fl2k433_fprintf(stderr, "start(): Could not initialize carrier.\n");
-		return r;
-	}
-
 	fl2k->opstate = (fl2k->cfg.out_dir[0] ? FL2K433_STARTUP_FILE : FL2K433_STARTUP_FL2K);
 	fl2k->txqueue_sent = 0;
+
+	double samplesPerCycle = (double)fl2k->cfg.samp_rate / (double)fl2k->cfg.carrier1;
+	if (samplesPerCycle < 2.0 && fl2k->cfg.verbose > 0) fl2k433_fprintf(stderr, "Warning: Frequency of primary carrier signal (%lu) higher than %lu, violating Nyquist theoreom.\n", fl2k->cfg.carrier1, (fl2k->cfg.samp_rate + 1) / 2);
 
 	if(fl2k->opstate == FL2K433_STARTUP_FL2K){
 		fl2k->starttime = getMilliSeconds();
 		if (InitFl2k(fl2k)) {
-			if (fl2k->cfg.verbose > 0) fl2k433_fprintf(stderr, "start(): fl2k_433 was started in FL2K mode.\n");
+			if (fl2k->cfg.verbose > 0) fl2k433_fprintf(stdout, "start(): fl2k_433 was started in FL2K mode.\n");
 			while (fl2k->opstate != FL2K433_STOPPED) sleep_ms(200);
 			r = 1;
 		}
@@ -371,7 +322,7 @@ FL2K_433_API int txstart(fl2k_433_t *fl2k) {
 	// Operation (fl2k thread blocks until we're finished)
 	else if (fl2k->opstate == FL2K433_STARTUP_FILE) {
 		fl2k->cancel_filemode = 0;
-		if (fl2k->cfg.verbose > 0) fl2k433_fprintf(stderr, "start(): fl2k_433 was started in file mode.\n");
+		if (fl2k->cfg.verbose > 0) fl2k433_fprintf(stdout, "start(): fl2k_433 was started in file mode.\n");
 		file_mode(fl2k);
 		r = 1;
 	}
@@ -404,7 +355,7 @@ static int InitFl2k(fl2k_433_t *fl2k) {
 		return 0;
 	}
 
-	if (fl2k->cfg.verbose > 0) fl2k433_fprintf(stderr, "Using device %d: %s\n", fl2k->cfg.dev_index, (product ? product : "n/a"));
+	if (fl2k->cfg.verbose > 0) fl2k433_fprintf(stdout, "Using device %d: %s\n", fl2k->cfg.dev_index, (product ? product : "n/a"));
 
 	/* Start TX thread */
 	if (fl2k_start_tx(fl2k->dev, fl2k_callback, fl2k, 0) < 0) {
@@ -421,15 +372,7 @@ static int InitFl2k(fl2k_433_t *fl2k) {
 	return 1;
 }
 
-static int isBufFilled(char *buf, int len) {
-	if (!buf) return 0;
-	for (int a = 0; a < len; a++) {
-		if (buf[a] != 0) return 1;
-	}
-	return 0;
-}
-
-static FILE *openOutputFile(char *dir, uint32_t samp_rate, uint32_t carrier, uint32_t filenum) {
+static FILE *openOutputFile(char *dir, mod_type mod, uint32_t samp_rate, uint32_t carrier1, uint32_t carrier2, uint32_t *filenum) {
 	FILE *r = 0;
 
 	if (!dir) return r;
@@ -443,50 +386,62 @@ static FILE *openOutputFile(char *dir, uint32_t samp_rate, uint32_t carrier, uin
 	// add filename
 	char *fname = &path[strlen(path)];
 	size_t fname_cap = sizeof(path) - strlen(path);
-	sprintf_s(fname, fname_cap, "s_%lu_c_%lu_%lu.bin", samp_rate, carrier, filenum); // todo: add time etc.?
-
-	if (_access(path, F_OK) != 0) {
-		r = fopen(path, "wb");
-		if (!r) fl2k433_fprintf(stderr, "Failed to open %s\n", path);
+	for (int a = 0; a < 100; a++) {
+		if (mod == MODULATION_TYPE_FSK) {
+			sprintf_s(fname, fname_cap, "FSK_s%lu_cp%lu_cs%lu_%lu.bin", samp_rate, carrier1, carrier2, *filenum); // todo: add time etc.?
+		}
+		else {
+			sprintf_s(fname, fname_cap, "OOK_s%lu_c%lu_%lu.bin", samp_rate, carrier1, *filenum); // todo: add time etc.?
+		}
+		if (_access(path, F_OK) == 0) {
+			fl2k433_fprintf(stdout, "openOutputFile: Output file %s already exists, trying next...\n", path);
+		}
+		else{
+			r = fopen(path, "wb");
+			if (r) break;
+			else fl2k433_fprintf(stderr, "openOutputFile: Failed to open %s, trying next...\n", path);
+		}
+		(*filenum)++;
 	}
-	else fl2k433_fprintf(stderr, "Output file %s already exists, skipping\n", path);
+
+	if (!r) {
+		fl2k433_fprintf(stdout, "openOutputFile: giving up...\n");
+	}
 
 	return r;
 }
 
 void *file_mode(fl2k_433_t *fl2k) {
-	fl2k_data_info_t dat_inf;
-	dat_inf.ctx = fl2k;
-	dat_inf.underflow_cnt = 0;
-	dat_inf.len = FL2K_BUF_LEN;
-	dat_inf.using_zerocopy = 0;
-	dat_inf.device_error = 0;
+	fl2k_data_info_fm_t extdat;
+	extdat.di.ctx = fl2k;
+	extdat.di.underflow_cnt = 0;
+	extdat.di.len = FL2K_BUF_LEN;
+	extdat.di.using_zerocopy = 0;
+	extdat.di.device_error = 0;
+	extdat.msg_mod = MODULATION_TYPE_NONE;
+	extdat.msg_finished = 0;
 
 	FILE *crnt_file = NULL;
 	uint32_t num_files = 0;
 	while (!fl2k->cancel_filemode) {
 		// acquire data
-		fl2k_callback(&dat_inf);
-		// signal contained?
-		if (isBufFilled(dat_inf.r_buf, dat_inf.len)) {
-			// Create new file, if necessary
-			if (!crnt_file) {
+		extdat.msg_mod = MODULATION_TYPE_NONE;
+		extdat.msg_finished = 0;
+		fl2k_callback((fl2k_data_info_t*) &extdat);
+		if (extdat.msg_mod != MODULATION_TYPE_NONE) {
+			if (!crnt_file) { // Create new file, if necessary
 				num_files++;
-				crnt_file = openOutputFile(fl2k->cfg.out_dir, fl2k->cfg.samp_rate, fl2k->cfg.carrier, num_files);
+				crnt_file = openOutputFile(fl2k->cfg.out_dir, extdat.msg_mod, fl2k->cfg.samp_rate, fl2k->cfg.carrier1, fl2k->cfg.carrier2, &num_files);
 			}
-			if (crnt_file) {
-				// write data
-				if (fwrite(dat_inf.r_buf, 1, dat_inf.len, crnt_file) != dat_inf.len) {
-					fl2k433_fprintf(stderr, "Short write, samples lost.\n");
+			if (crnt_file) { // write data
+				if (fwrite(extdat.di.r_buf, 1, extdat.di.len, crnt_file) != extdat.di.len) {
+					fl2k433_fprintf(stderr, "file_mode: Short write, samples lost.\n");
 				}
 			}
 		}
-		// no signal contained. Close last file (if any)
-		else {
-			if (crnt_file) {
-				fclose(crnt_file);
-				crnt_file = NULL;
-			}
+		if(extdat.msg_finished && crnt_file) {
+			fclose(crnt_file);
+			crnt_file = NULL;
 		}
 		sleep_ms(FILEMODE_SLEEP_TIME);
 	}

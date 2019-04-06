@@ -17,6 +17,9 @@
     <ClCompile Include="..\src\redir_print.c">
       <Filter>Source files</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\sinegen.c">
+      <Filter>Source files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\include\libfl2k_433.h">
@@ -26,6 +29,9 @@
       <Filter>Headerdateien</Filter>
     </ClInclude>
     <ClInclude Include="..\include\redir_print.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="..\include\sinegen.h">
       <Filter>Headerdateien</Filter>
     </ClInclude>
   </ItemGroup>
